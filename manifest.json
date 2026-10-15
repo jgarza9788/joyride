@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "jgarza.joyride",
+  "name": "Joyride",
+  "version": "0.1.0",
+  "author": "jgarza",
+  "license": "MIT",
+  "homepage": "https://github.com/jgarza9788/joyride",
+  "description": "Drive Omarchy with a game controller (Xbox, PlayStation, Switch or generic): window and workspace navigation, menus, a mouse mode, and a two-thumbstick on-screen keyboard. Hold Guide (or Start+Select) to take control; otherwise games get the pad untouched.",
+  "preview": "preview.png",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Overlay.qml"
+  }
+}

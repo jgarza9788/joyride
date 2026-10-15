@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""joyride-input: read game controllers from evdev, print normalized events.
+
+stdout, one JSON object per line:
+  {"t":"pad","ev":"add"|"remove","id":"event15","name":"...","kind":"xbox|playstation|nintendo|generic"}
+  {"t":"btn","name":"south","v":1}
+  {"t":"axes","lx":0.0,"ly":0.0,"rx":0.0,"ry":0.0,"lt":0.0,"rt":0.0}
+stdin, one JSON object per line:
+  {"cmd":"grab","v":true}                 take/release exclusive access to pads
+  {"cmd":"mouse","on":true,"speed":1400,"scroll":12,"deadzone":0.18}
+  {"cmd":"quit"}
+
+Mouse mode runs in this process (right stick moves the pointer, left stick
+scrolls, south/east/west click) so pointer latency never waits on the shell.
+
+Stdlib only. --dump prints raw evdev codes for building a mapping override.
+"""
+import fcntl
+import glob
+import json
+import os
+import select
+import struct
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mappings  # noqa: E402
+
+EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
+REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0, 1, 6, 8
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+EVENT = struct.Struct("llHHi")
+FLUSH_S = 1 / 60.0
+MOUSE_S = 1 / 125.0
+
+
+def _ioc(direction, nr, size, typ=ord("E")):
+    return (direction << 30) | (size << 16) | (typ << 8) | nr
+
+
+def EVIOCGNAME(n): return _ioc(2, 0x06, n)
+def EVIOCGBIT(ev, n): return _ioc(2, 0x20 + ev, n)
+def EVIOCGABS(a): return _ioc(2, 0x40 + a, 24)
+EVIOCGID = _ioc(2, 0x02, 8)
+EVIOCGRAB = _ioc(1, 0x90, 4)
+
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_RELBIT = 0x40045564, 0x40045565, 0x40045566
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def bits(fd, ev, nbits):
+    buf = bytearray(nbits // 8 + 1)
+    try:
+        fcntl.ioctl(fd, EVIOCGBIT(ev, len(buf)), buf)
+    except OSError:
+        return set()
+    return {i for i in range(nbits) if buf[i >> 3] & (1 << (i & 7))}
+
+
+def load_overrides():
+    path = os.path.expanduser("~/.config/jgarza.joyride/mappings.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+class Pad:
+    def __init__(self, path, fd, name, vendor, product, profile, ranges):
+        self.path, self.fd, self.name = path, fd, name
+        self.vendor, self.product = vendor, product
+        self.profile, self.ranges = profile, ranges
+        self.id = os.path.basename(path)
+        self.grabbed = False
+
+    def set_grab(self, want):
+        if want == self.grabbed:
+            return
+        try:
+            fcntl.ioctl(self.fd, EVIOCGRAB, 1 if want else 0)
+            self.grabbed = want
+        except OSError:
+            pass
+
+
+class Uinput:
+    """A virtual mouse made through /dev/uinput (legacy uinput_user_dev)."""
+
+    def __init__(self):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        for b in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE):
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, b)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_REL)
+        for r in (REL_X, REL_Y, REL_WHEEL, REL_HWHEEL):
+            fcntl.ioctl(self.fd, UI_SET_RELBIT, r)
+        name = b"joyride virtual mouse".ljust(80, b"\0")
+        dev = name + struct.pack("<HHHHi", 0x03, 0x1209, 0x7001, 1, 0) + bytes(64 * 4 * 4)
+        os.write(self.fd, dev)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+    def _send(self, typ, code, val):
+        os.write(self.fd, EVENT.pack(0, 0, typ, code, val))
+
+    def move(self, dx, dy, wheel=0, hwheel=0):
+        if dx: self._send(EV_REL, REL_X, dx)
+        if dy: self._send(EV_REL, REL_Y, dy)
+        if wheel: self._send(EV_REL, REL_WHEEL, wheel)
+        if hwheel: self._send(EV_REL, REL_HWHEEL, hwheel)
+        if dx or dy or wheel or hwheel:
+            self._send(EV_SYN, 0, 0)
+
+    def button(self, code, val):
+        self._send(EV_KEY, code, val)
+        self._send(EV_SYN, 0, 0)
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        finally:
+            os.close(self.fd)
+
+
+class Daemon:
+    def __init__(self, dump=False):
+        self.dump = dump
+        self.pads = {}
+        self.overrides = load_overrides()
+        self.want_grab = False
+        self.axes = {k: 0.0 for k in ("lx", "ly", "rx", "ry", "lt", "rt")}
+        self.hat = {"hat_x": 0, "hat_y": 0}
+        self.dirty = False
+        self.mouse_on = False
+        self.mouse_cfg = {"speed": 1400.0, "scroll": 12.0, "deadzone": 0.18}
+        self.uinput = None
+        self.carry = [0.0, 0.0, 0.0, 0.0]
+        self.trig_down = {"l2": False, "r2": False}
+        self.stdin_buf = b""
+        self.running = True
+
+    # ── device discovery ──
+    def scan(self):
+        seen = set()
+        for path in glob.glob("/dev/input/event*"):
+            seen.add(path)
+            if path in self.pads:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            try:
+                keys = bits(fd, EV_KEY, 0x300)
+                abs_codes = bits(fd, EV_ABS, 0x40)
+                if not mappings.is_gamepad(keys, abs_codes):
+                    os.close(fd)
+                    continue
+                nbuf = bytearray(128)
+                n = fcntl.ioctl(fd, EVIOCGNAME(128), nbuf)
+                name = bytes(nbuf[:max(0, n - 1)]).decode("utf-8", "replace")
+                _bus, vendor, product, _ver = struct.unpack("<HHHH", fcntl.ioctl(fd, EVIOCGID, bytes(8)))
+                key = "%04x:%04x" % (vendor, product)
+                profile = mappings.classify(vendor, product, keys, abs_codes, self.overrides.get(key))
+                ranges = {}
+                for code in profile["axes"]:
+                    if code in abs_codes:
+                        info = struct.unpack("<6i", fcntl.ioctl(fd, EVIOCGABS(code), bytes(24)))
+                        ranges[code] = (info[1], info[2])
+            except OSError:
+                os.close(fd)
+                continue
+            pad = Pad(path, fd, name, vendor, product, profile, ranges)
+            pad.set_grab(self.want_grab)
+            self.pads[path] = pad
+            emit({"t": "pad", "ev": "add", "id": pad.id, "name": name,
+                  "kind": profile["kind"], "vendor": "%04x" % vendor, "product": "%04x" % product})
+        for path in [p for p in self.pads if p not in seen]:
+            self.drop(path)
+
+    def drop(self, path):
+        pad = self.pads.pop(path, None)
+        if not pad:
+            return
+        try:
+            os.close(pad.fd)
+        except OSError:
+            pass
+        emit({"t": "pad", "ev": "remove", "id": pad.id, "name": pad.name})
+        if not self.pads:
+            self.axes = {k: 0.0 for k in self.axes}
+            self.dirty = True
+
+    # ── event handling ──
+    def on_pad_readable(self, pad):
+        try:
+            data = os.read(pad.fd, EVENT.size * 64)
+        except BlockingIOError:
+            return
+        except OSError:
+            self.drop(pad.path)
+            return
+        for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _s, _u, typ, code, val = EVENT.unpack_from(data, off)
+            if self.dump and typ in (EV_KEY, EV_ABS):
+                emit({"t": "raw", "id": pad.id, "type": typ, "code": code, "v": val})
+            if typ == EV_KEY and val != 2:
+                name = pad.profile["buttons"].get(code)
+                if name:
+                    self.button(name, val)
+            elif typ == EV_ABS:
+                spec = pad.profile["axes"].get(code)
+                if spec:
+                    lo, hi = pad.ranges.get(code, (-32768, 32767))
+                    self.axis(spec[0], spec[1], mappings.normalize(val, lo, hi, spec[1]))
+
+    def button(self, name, val):
+        if self.mouse_on and self.uinput:
+            code = {"south": BTN_LEFT, "east": BTN_RIGHT, "west": BTN_MIDDLE}.get(name)
+            if code:
+                self.uinput.button(code, val)
+                return
+        emit({"t": "btn", "name": name, "v": val})
+
+    def axis(self, name, typ, value):
+        if typ == "hat":
+            old = self.hat[name]
+            self.hat[name] = value
+            pair = (("dpad_left", "dpad_right") if name == "hat_x" else ("dpad_up", "dpad_down"))
+            if old != value:
+                if old: self.button(pair[0 if old < 0 else 1], 0)
+                if value: self.button(pair[0 if value < 0 else 1], 1)
+            return
+        if abs(self.axes.get(name, 0.0) - value) > 0.004:
+            self.axes[name] = value
+            self.dirty = True
+            if typ == "trigger":
+                self.trigger_button(name)
+
+    def trigger_button(self, name):
+        key = "l2" if name == "lt" else "r2"
+        down = self.axes[name] > 0.5
+        if down != self.trig_down[key]:
+            self.trig_down[key] = down
+            self.button(key, 1 if down else 0)
+
+    def flush_axes(self):
+        if self.dirty:
+            self.dirty = False
+            out = {"t": "axes"}
+            out.update({k: round(v, 3) for k, v in self.axes.items()})
+            emit(out)
+
+    # ── mouse mode ──
+    def mouse_tick(self, dt):
+        cfg, dz = self.mouse_cfg, self.mouse_cfg["deadzone"]
+
+        def shaped(v):
+            if abs(v) < dz:
+                return 0.0
+            s = (abs(v) - dz) / (1 - dz)
+            return (s * s) * (1 if v > 0 else -1)
+
+        vals = (shaped(self.axes["rx"]) * cfg["speed"] * dt,
+                shaped(self.axes["ry"]) * cfg["speed"] * dt,
+                -shaped(self.axes["ly"]) * cfg["scroll"] * dt,
+                shaped(self.axes["lx"]) * cfg["scroll"] * dt)
+        out = []
+        for i, v in enumerate(vals):
+            self.carry[i] += v
+            whole = int(self.carry[i])
+            self.carry[i] -= whole
+            out.append(whole)
+        self.uinput.move(out[0], out[1], out[2], out[3])
+
+    def set_mouse(self, on, cfg):
+        for k in ("speed", "scroll", "deadzone"):
+            if k in cfg:
+                self.mouse_cfg[k] = float(cfg[k])
+        if on and not self.uinput:
+            try:
+                self.uinput = Uinput()
+            except OSError as e:
+                emit({"t": "error", "msg": "uinput: %s" % e})
+                on = False
+        self.mouse_on = on
+        self.carry = [0.0] * 4
+        emit({"t": "mouse", "on": on})
+
+    # ── stdin commands ──
+    def on_stdin(self):
+        try:
+            chunk = os.read(0, 4096)
+        except BlockingIOError:
+            return
+        if not chunk:
+            self.running = False
+            return
+        self.stdin_buf += chunk
+        while b"\n" in self.stdin_buf:
+            line, self.stdin_buf = self.stdin_buf.split(b"\n", 1)
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            cmd = msg.get("cmd")
+            if cmd == "grab":
+                self.want_grab = bool(msg.get("v"))
+                for p in self.pads.values():
+                    p.set_grab(self.want_grab)
+            elif cmd == "mouse":
+                self.set_mouse(bool(msg.get("on")), msg)
+            elif cmd == "quit":
+                self.running = False
+
+    def run(self):
+        os.set_blocking(0, False)
+        next_scan = last_flush = last_mouse = 0.0
+        while self.running:
+            now = time.monotonic()
+            if now >= next_scan:
+                self.scan()
+                next_scan = now + 2.0
+            fds = [0] + [p.fd for p in self.pads.values()]
+            timeout = MOUSE_S if self.mouse_on else FLUSH_S
+            try:
+                ready, _, _ = select.select(fds, [], [], timeout)
+            except (OSError, ValueError):
+                ready = []
+            by_fd = {p.fd: p for p in self.pads.values()}
+            for fd in ready:
+                if fd == 0:
+                    self.on_stdin()
+                elif fd in by_fd:
+                    self.on_pad_readable(by_fd[fd])
+            now = time.monotonic()
+            if now - last_flush >= FLUSH_S:
+                last_flush = now
+                self.flush_axes()
+            if self.mouse_on and self.uinput and now - last_mouse >= MOUSE_S:
+                self.mouse_tick(now - last_mouse if last_mouse else MOUSE_S)
+                last_mouse = now
+            elif not self.mouse_on:
+                last_mouse = 0.0
+        self.shutdown()
+
+    def shutdown(self):
+        for p in list(self.pads.values()):
+            p.set_grab(False)
+        if self.uinput:
+            self.uinput.close()
+
+
+if __name__ == "__main__":
+    try:
+        Daemon(dump="--dump" in sys.argv).run()
+    except KeyboardInterrupt:
+        pass
