@@ -8,7 +8,7 @@
 //   {t:"hypr", lua:"hl.dsp...", legacy:"dispatcher args"}  Hyprland dispatch
 //   {t:"exec", argv:[...]}                                  run a command
 //   {t:"keys", keys:["Return"]}                             wtype -k each
-//   {t:"text", text:"a"}                                    wtype -- text
+//   {t:"text", text:"a"}                                    typed via the helper (wtype - on stdin)
 //   {t:"mode", mode:"nav", prev:"off"}                      mode changed
 // Buttons are named by physical position (see bin/mappings.py):
 //   south east west north l1 r1 l2 r2 l3 r3 select start guide dpad_*

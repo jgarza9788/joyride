@@ -121,7 +121,7 @@ Item {
         for (var k = 0; k < a.keys.length; k++) { argv.push("-k"); argv.push(a.keys[k]) }
         Quickshell.execDetached(argv)
       } else if (a.t === "text") {
-        Quickshell.execDetached(["wtype", "--", a.text])
+        root.send({ cmd: "type", text: a.text })
       } else if (a.t === "mode") {
         root.applyMode(a.mode)
       }

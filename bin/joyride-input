@@ -8,6 +8,7 @@ stdout, one JSON object per line:
 stdin, one JSON object per line:
   {"cmd":"grab","v":true}                 take/release exclusive access to pads
   {"cmd":"mouse","on":true,"speed":1400,"scroll":12,"deadzone":0.18}
+  {"cmd":"type","text":"a"}               type text via wtype (text goes over stdin, never argv)
   {"cmd":"quit"}
 
 Mouse mode runs in this process (right stick moves the pointer, left stick
@@ -21,6 +22,7 @@ import json
 import os
 import select
 import struct
+import subprocess
 import sys
 import time
 
@@ -143,6 +145,7 @@ class Daemon:
         self.carry = [0.0, 0.0, 0.0, 0.0]
         self.trig_down = {"l2": False, "r2": False}
         self.stdin_buf = b""
+        self.typers = []
         self.running = True
 
     # ── device discovery ──
@@ -316,8 +319,24 @@ class Daemon:
                     p.set_grab(self.want_grab)
             elif cmd == "mouse":
                 self.set_mouse(bool(msg.get("on")), msg)
+            elif cmd == "type":
+                self.type_text(msg.get("text"))
             elif cmd == "quit":
                 self.running = False
+
+    def type_text(self, text):
+        # Typed text can be a password: hand it to wtype on stdin so it never
+        # shows up in a process listing.
+        if not isinstance(text, str) or not text:
+            return
+        try:
+            proc = subprocess.Popen(["wtype", "-"], stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.stdin.write(text.encode())
+            proc.stdin.close()
+        except OSError:
+            return
+        self.typers.append(proc)
 
     def run(self):
         os.set_blocking(0, False)
@@ -339,6 +358,7 @@ class Daemon:
                     self.on_stdin()
                 elif fd in by_fd:
                     self.on_pad_readable(by_fd[fd])
+            self.typers = [t for t in self.typers if t.poll() is None]
             now = time.monotonic()
             if now - last_flush >= FLUSH_S:
                 last_flush = now
